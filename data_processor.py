@@ -1,7 +1,7 @@
 """
 data_processor.py
 Processes Kaggle NBA datasets to create static player season averages.
-Output: processed_players.csv (Rows = Player-Seasons)
+Output: processed_players.parquet (Rows = Player-Seasons)
 """
 
 import pandas as pd
@@ -9,13 +9,12 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 import logging
-import argparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Scoring settings for fantasy points calculation
-# Can be cuztomizable later but this is my league's settings
+#  Scoring settings for fantasy points calculation
+# Can be adjusted as needed
 FANTASY_SETTINGS = {
     "pts": 1.0,
     "reb": 1,
@@ -64,7 +63,7 @@ def convert_types(df: pd.DataFrame, type_map: dict) -> pd.DataFrame:
     return df
 
 
-# Points calculations
+# Points calculation
 def calculate_fantasy_points(
     df: pd.DataFrame,
     settings: dict = FANTASY_SETTINGS,
@@ -103,20 +102,20 @@ def calculate_fantasy_points(
     
     return fpts
 
+# Loading functions
 def load_player_per_game(filepath: str | Path) -> pd.DataFrame:
     """Load and clean Player Per Game stats."""
     logger.info(f"Loading Player Per Game from {filepath}")
     
     df = pd.read_csv(filepath)
     
-    # Expected columns 
     # Common names: player, season, tm, g, gs, mp, fg, fga, fg%, 3p, 3pa, 3p%,
     #               ft, fta, ft%, orb, drb, trb, ast, stl, blk, tov, pf, pts
     
     # Normalize column names to lowercase
     df.columns = df.columns.str.lower().str.strip()
     
-    # Type conversions - matched to Kaggle column names
+    # Type conversions 
     type_map = {
         'season': 'int',
         'g': 'int',
@@ -181,13 +180,13 @@ def load_team_stats(filepath: str | Path) -> pd.DataFrame:
     return df
 
 
-# Processors for player and team data
+# Processing pipeliness
 def process_players(
     player_per_game_path: str | Path,
     player_advanced_path: str | Path,
     output_path: str | Path,
-    min_year: int = 2018,
-    min_games: int = 10, # Minimum games played to include
+    min_year: int = 2022,
+    min_games: int = 10,
 ) -> pd.DataFrame:
     """
     Process player season averages.
@@ -238,7 +237,7 @@ def process_players(
     logger.info("Merging with advanced stats")
     merge_cols = ['player', 'season']
     
-    adv_cols = ['player', 'season', 'per', 'ws', 'bpm', 'vorp', 'ts_percent', 'usg_percent']
+    adv_cols = ['player', 'season', 'per', 'usg_percent', 'ws', 'bpm', 'vorp']
     adv_cols = [c for c in adv_cols if c in player_adv.columns]
     
     df = player_pg.merge(
@@ -276,7 +275,7 @@ def process_players(
     logger.info(f"Final columns: {list(df.columns)}")
     
     # Output
-    save_dataframe(df, output_path)
+    _save_dataframe(df, output_path)
     
     return df
 
@@ -285,7 +284,7 @@ def process_teams(
     team_stats_path: str | Path,
     team_summaries_path: str | Path,
     output_path: str | Path,
-    min_year: int = 2018,
+    min_year: int = 2022,
 ) -> pd.DataFrame:
     """
     Process team stats for opponent matchup features.
@@ -295,7 +294,7 @@ def process_teams(
     - Team Summaries: pace, o_rtg, d_rtg
     
     Output columns:
-    - abbreviation (need later for joining with the nba api game logs not for model features)
+    - abbreviation (for joining with game log matchups)
     - season
     - team_pace, team_ortg, team_drtg
     - team_pts_per_game
@@ -313,18 +312,18 @@ def process_teams(
     df_summaries = pd.read_csv(team_summaries_path)
     df_summaries.columns = df_summaries.columns.str.lower().str.strip()
     
-    # Filter for modern era and regular season only
+    # Filter for modern era
     df_stats['season'] = pd.to_numeric(df_stats['season'], errors='coerce')
     df_summaries['season'] = pd.to_numeric(df_summaries['season'], errors='coerce')
     
     df_stats = df_stats[df_stats['season'] >= min_year].copy()
     df_summaries = df_summaries[df_summaries['season'] >= min_year].copy()
-    
-    # Filter out playoffs (keep regular season only)
-    if 'playoffs' in df_stats.columns:
-        df_stats = df_stats[df_stats['playoffs'] == False].copy()
-    if 'playoffs' in df_summaries.columns:
-        df_summaries = df_summaries[df_summaries['playoffs'] == False].copy()
+
+    # Remove league average rows (empty team/abbreviation)
+    if 'abbreviation' in df_stats.columns:
+        df_stats = df_stats[df_stats['abbreviation'].notna() & (df_stats['abbreviation'] != '')].copy()
+    if 'abbreviation' in df_summaries.columns:
+        df_summaries = df_summaries[df_summaries['abbreviation'].notna() & (df_summaries['abbreviation'] != '')].copy()
     
     # Select columns from each source
     stats_cols = ['abbreviation', 'season', 'pts_per_game']
@@ -364,25 +363,16 @@ def process_teams(
     logger.info(f"Team-seasons processed: {len(df)}")
     
     # Output
-    save_dataframe(df, output_path)
+    _save_dataframe(df, output_path)
     
     return df
 
 
-def save_dataframe(df: pd.DataFrame, output_path: str | Path) -> None:
-    """Save dataframe to CSV"""
+def _save_dataframe(df: pd.DataFrame, output_path: str | Path) -> None:
+    """Save dataframe to CSV or parquet based on extension."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Saving to {output_path} (shape: {df.shape})")
     
-    if output_path.suffix == '.csv':
-        df.to_csv(output_path, index=False)
-        logger.info(f"Saved CSV format")
-    else:
-        df.to_csv(output_path.with_suffix('.csv'), index=False)
-        df.to_parquet(output_path.with_suffix('.parquet'), index=False)
-        logger.info(f"Saved both CSV and parquet formats")
-
-
-
+    df.to_csv(output_path, index=False)
