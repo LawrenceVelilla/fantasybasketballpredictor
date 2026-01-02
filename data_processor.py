@@ -150,8 +150,8 @@ def load_player_advanced(filepath: str | Path) -> pd.DataFrame:
     type_map = {
         'season': 'int',
         'per': 'numeric',
-        'ts%': 'numeric',
-        'usg%': 'numeric',
+        'ts_percent': 'numeric',
+        'usg_percent': 'numeric',
         'ws': 'numeric',
         'bpm': 'numeric',
         'vorp': 'numeric',
@@ -238,7 +238,7 @@ def process_players(
     logger.info("Merging with advanced stats")
     merge_cols = ['player', 'season']
     
-    adv_cols = ['player', 'season', 'per', 'ws', 'bpm', 'vorp']
+    adv_cols = ['player', 'season', 'per', 'ws', 'bpm', 'vorp', 'ts_percent', 'usg_percent']
     adv_cols = [c for c in adv_cols if c in player_adv.columns]
     
     df = player_pg.merge(
@@ -257,12 +257,16 @@ def process_players(
     
     # Features (for model)
     feature_cols = [
+        # Per Game Stats
         'pts_per_game', 'ast_per_game', 'trb_per_game',
-        'stl_per_game', 'blk_per_game', 'tov_per_game',
-        'fg_percent', 'ft_percent', 'x3p_percent',
-        'mp_per_game', 'g',  # games played, minutes context
-        'fppg',  # calculated baseline fantasy points
-        'per',   # player efficiency rating
+        'stl_per_game', 'blk_per_game', 'tov_per_game', 
+
+        'fg_percent', 'ft_percent', 'x3p_percent', # shooting efficiency
+        'mp_per_game', 'g',  # games played, minutes context 
+        'fppg',  # calculated baseline fantasy points per game
+        'per',   # player efficiency rating from advanced stats
+         
+        # 'ts_percent', 'usg_percent', # Removing these for now as they may introduce noise
     ]
     
     # Keep only columns that exist
