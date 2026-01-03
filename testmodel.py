@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 ROLLING_FEATURES = [
     'pts_last_5', 'reb_last_5', 'ast_last_5',
     'stl_last_5', 'blk_last_5', 'tov_last_5',
-    'min_last_5', 'fppg_last_3', 'fppg_last_5'# Removed 'fppg_last_5' and score went up a little
+    'min_last_5', 'fppg_last_3', 'fppg_last_5', # Removed 'fppg_last_5' and score went up a little
     'min_last_3', 'pts_last_3', 'reb_last_3',
     'ast_last_3', 'stl_last_3', 'blk_last_3', 'tov_last_3'
 ]
@@ -36,7 +36,7 @@ ROLLING_FEATURES = [
 # Season-to-date features (from game_logs_features.csv - dynamic, no leakage)
 SEASON_TO_DATE_FEATURES = [
     'pts_season_avg', 'reb_season_avg', 'ast_season_avg',
-    'stl_season_avg', 'blk_season_avg', 'tov_season_avg',
+    'stl_season_avg', 'blk_season_avg', 'tov_season_avg', 'min_season_avg',
     'fppg_season_avg', 'games_played_season',
 ]
 
@@ -371,6 +371,7 @@ def split_by_season(
 def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
+    weights: Optional[np.ndarray] = None,
     **xgb_params
 ) -> XGBRegressor:
     """Train XGBoost regressor."""
@@ -384,7 +385,9 @@ def train_model(
         'colsample_bytree': 0.001,
         'random_state': 42,
         'n_jobs': -1,
+        'objective': 'reg:squarederror',
     }
+
     
     # Override with any provided params
     params = {**default_params, **xgb_params}
@@ -665,7 +668,7 @@ def train_pipeline(
     model_output_path: str = "./models/fantasy_predictor",
     plots_output_dir: str = "./plots",
     test_season: int = 2024,
-    generate_plots: bool = True,
+    generate_plots: bool = False,
 ) -> Tuple[XGBRegressor, dict, pd.DataFrame]:
     """
     Full training pipeline.
@@ -688,6 +691,15 @@ def train_pipeline(
     logger.info("Filling season-to-date NaN values with baseline stats...")
     df = fill_season_to_date_with_baseline(df)
 
+    # Minutes filter didnt work, actually lowered the R^2 a good amount
+    # # Filter to ensure we only have valuable players with more than (=) 25 minutes in last 5 games and 25 minutes in last 3 games
+    # df = df[(df['min_last_5'] >= 30) & (df['min_last_3'] >= 30)].copy()
+    
+    # Filter for players more than 25 minutes in the season on average
+    # df = df[df['min_season_avg'] >= 30].copy()
+
+    logger.info(f"Filtered to {len(df)} game logs after applying minimum minutes criteria.")
+
     # 3. Prepare features
     X, y, feature_names = prepare_features(df)
     
@@ -697,7 +709,7 @@ def train_pipeline(
     )
     
     # 5. Train model
-    model = train_model(X_train, y_train)
+    model = train_model(X_train, y_train, weights=None)
     
     # 6. Evaluate
     metrics = evaluate_model(model, X_test, y_test)
@@ -713,11 +725,6 @@ def train_pipeline(
     save_model(model, model_output_path, feature_names)
     
     return model, metrics, importance
-
-
-# =============================================================================
-# CLI ENTRYPOINT
-# =============================================================================
 
 if __name__ == "__main__":
     import argparse

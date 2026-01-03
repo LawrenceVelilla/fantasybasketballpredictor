@@ -14,6 +14,12 @@ import time
 from nba_api.stats.endpoints import leaguegamelog, playergamelog
 from nba_api.stats.static import players, teams
 
+"""
+Todo:
+
+Add team stats to game logs, helps in calculating usage rate which in turn helps in model prediction
+"""
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,7 @@ def fetch_league_game_logs(
         )
         df = game_log.get_data_frames()[0]
         logger.info(f"Fetched {len(df)} game logs for {season}")
+        logger.info(f"Columns: {list(df.columns)}")
         return df
     
     except Exception as e:
@@ -185,6 +192,19 @@ def calculate_rolling_features(
             )
     
     return df
+
+def calculate_usage_pergame(df: pd.DataFrame) -> float:
+    """
+    Calculate minutes per game for each player.
+
+    ((FGA + 0.44 * FTA + TOV) * (Team Minutes / 5)) / (Player Minutes * (Team FGA + 0.44 * Team FTA + Team TOV))
+    Make team minutes = 240 (48 minutes * 5 players) for simplicity
+    """
+    df = df.copy()
+    logger.info("Calculating minutes per game for each player") 
+    usg = ((df['FGA'] + 0.44 * df['FTA'] + df['TOV']) * (240 / 5)) / (df['MIN'] * (df['TEAM_FGA'] + 0.44 * df['TEAM_FTA'] + df['TEAM_TOV']))
+    
+    return usg
 
 
 def calculate_season_to_date_features(

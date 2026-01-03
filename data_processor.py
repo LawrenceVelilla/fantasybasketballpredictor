@@ -4,6 +4,14 @@ Processes Kaggle NBA datasets to create static player season averages.
 Output: processed_players.parquet (Rows = Player-Seasons)
 """
 
+'''
+Todo:
+
+Filter training set on relevant players, e.g. min games played, recent seasons only
+
+'''
+
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -271,7 +279,7 @@ def process_players(
     # Keep only columns that exist
     keep_cols = [c for c in id_cols + feature_cols if c in df.columns]
     df = df[keep_cols].copy()
-    
+ 
     logger.info(f"Final columns: {list(df.columns)}")
     
     # Output
