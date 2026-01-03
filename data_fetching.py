@@ -187,6 +187,55 @@ def calculate_rolling_features(
     return df
 
 
+def calculate_season_to_date_features(
+    df: pd.DataFrame,
+    stats: List[str] = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT']
+) -> pd.DataFrame:
+    """
+    Calculate season-to-date averages for each player.
+
+    IMPORTANT: Uses expanding window with shift(1) to avoid data leakage -
+    averages are calculated from all PREVIOUS games in the season,
+    not including the current game.
+
+    For early season games with few prior games, these values will be based
+    on a small sample. The model should use baseline features as fallback.
+    """
+    df = df.copy()
+
+    # Ensure sorted by player, season, and date
+    df = df.sort_values(['PLAYER_ID', 'SEASON', 'GAME_DATE']).reset_index(drop=True)
+
+    logger.info("Calculating season-to-date averages")
+
+    for stat in stats:
+        if stat not in df.columns:
+            logger.warning(f"Column {stat} not found, skipping")
+            continue
+
+        col_name = f"{stat.lower()}_season_avg"
+
+        # shift(1) prevents data leakage - only uses games before current
+        # expanding() calculates cumulative average from start of season
+        df[col_name] = (
+            df.groupby(['PLAYER_ID', 'SEASON'])[stat]
+            .transform(lambda x: x.shift(1).expanding(min_periods=1).mean())
+        )
+
+    # Also calculate season-to-date fantasy points
+    df['fppg_season_avg'] = (
+        df.groupby(['PLAYER_ID', 'SEASON'])['actual_fantasy_pts']
+        .transform(lambda x: x.shift(1).expanding(min_periods=1).mean())
+    )
+
+    # Add game count in season (useful for knowing sample size)
+    df['games_played_season'] = (
+        df.groupby(['PLAYER_ID', 'SEASON']).cumcount()  # 0-indexed count of games before this one
+    )
+
+    return df
+
+
 def calculate_rest_days(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate days of rest between games for each player.
@@ -308,7 +357,11 @@ def process_game_logs(
             df.groupby('PLAYER_ID')['actual_fantasy_pts']
             .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
         )
-    
+
+    # Season-to-date features
+    season_stats = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT']
+    df = calculate_season_to_date_features(df, stats=season_stats)
+
     # Rest days
     df = calculate_rest_days(df)
     
@@ -359,7 +412,15 @@ def process_game_logs(
             col_name = f"{stat}_last_{window}"
             rolling_cols[col_name] = col_name  # already correct name
         rolling_cols[f"fppg_last_{window}"] = f"fppg_last_{window}"
-    
+
+    # Season-to-date features (model features)
+    season_avg_cols = {}
+    for stat in ['pts', 'reb', 'ast', 'stl', 'blk', 'tov', 'min', 'fg_pct']:
+        col_name = f"{stat}_season_avg"
+        season_avg_cols[col_name] = col_name
+    season_avg_cols['fppg_season_avg'] = 'fppg_season_avg'
+    season_avg_cols['games_played_season'] = 'games_played_season'
+
     # Situational features
     situation_cols = {
         'is_home': 'is_home',
@@ -368,7 +429,7 @@ def process_game_logs(
     }
     
     # Combine all column mappings
-    all_cols = {**id_cols, **target_cols, **game_stat_cols, **rolling_cols, **situation_cols}
+    all_cols = {**id_cols, **target_cols, **game_stat_cols, **rolling_cols, **season_avg_cols, **situation_cols}
     
     # Keep only columns that exist and rename
     keep_cols = {k: v for k, v in all_cols.items() if k in df.columns}

@@ -381,11 +381,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Process Kaggle NBA data")
-    parser.add_argument("--data-dir", type=str, default="./data",
+    parser.add_argument("--data-dir", type=str, default="./data/kaggle",
                         help="Directory containing Kaggle CSVs")
     parser.add_argument("--output-dir", type=str, default="./data/processed",
                         help="Output directory for processed files")
-    parser.add_argument("--min-year", type=int, default=2018,
+    parser.add_argument("--min-year", type=int, default=2022,
                         help="Minimum season year to include")
     parser.add_argument("--min-games", type=int, default=10,
                         help="Minimum games played to include")
