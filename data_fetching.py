@@ -154,7 +154,7 @@ def fetch_multiple_seasons(
 
 def calculate_rolling_features(
     df: pd.DataFrame,
-    windows: List[int] = [5, 10],
+    windows: List[int] = [3, 5, 10],
     stats: List[str] = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT']
 ) -> pd.DataFrame:
     """
@@ -249,7 +249,7 @@ def add_game_number(df: pd.DataFrame) -> pd.DataFrame:
 
 def process_game_logs(
     df: pd.DataFrame,
-    rolling_windows: List[int] = [5, 10]
+    rolling_windows: List[int] = [3, 5, 10]
 ) -> pd.DataFrame:
     """
     Main processing pipeline for game logs.
@@ -385,7 +385,7 @@ def fetch_and_process(
     end_year: int = 2024,
     output_path: str = "./data/processed/game_logs_features.csv",
     rate_limit_delay: float = 1.5,
-    rolling_windows: List[int] = [5, 10]
+    rolling_windows: List[int] = [3, 5, 10]
 ) -> pd.DataFrame:
     """
     Full pipeline: fetch from API, process, and save.
@@ -473,3 +473,35 @@ def fetch_player_recent_games(
         return pd.DataFrame()
 
 
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Fetch and process NBA game logs")
+    parser.add_argument("--start-year", type=int, default=2022,
+                        help="Starting season year")
+    parser.add_argument("--end-year", type=int, default=2024,
+                        help="Ending season year")
+    parser.add_argument("--output", type=str, 
+                        default="./data/processed/game_logs_features.csv",
+                        help="Output path (.csv or .parquet)")
+    parser.add_argument("--delay", type=float, default=0.6,
+                        help="Rate limit delay in seconds")
+    
+    args = parser.parse_args()
+    
+    df = fetch_and_process(
+        start_year=args.start_year,
+        end_year=args.end_year,
+        output_path=args.output,
+        rate_limit_delay=args.delay,
+    )
+    
+    if not df.empty:
+        print(f"\nProcessed {len(df)} game logs")
+        print(f"\nColumns: {list(df.columns)}")
+        print(f"\nSample data:")
+        sample_cols = ['player_name', 'game_date', 'pts', 'actual_fantasy_pts', 
+                       'pts_last_5', 'fppg_last_5', 'rest_days', 'is_home', 'opponent']
+        sample_cols = [c for c in sample_cols if c in df.columns]
+        print(df[sample_cols].head(10))
+        print(f"\nData types:\n{df.dtypes}")

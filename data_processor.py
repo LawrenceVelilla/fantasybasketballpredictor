@@ -376,3 +376,58 @@ def _save_dataframe(df: pd.DataFrame, output_path: str | Path) -> None:
     logger.info(f"Saving to {output_path} (shape: {df.shape})")
     
     df.to_csv(output_path, index=False)
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Process Kaggle NBA data")
+    parser.add_argument("--data-dir", type=str, default="./data",
+                        help="Directory containing Kaggle CSVs")
+    parser.add_argument("--output-dir", type=str, default="./data/processed",
+                        help="Output directory for processed files")
+    parser.add_argument("--min-year", type=int, default=2018,
+                        help="Minimum season year to include")
+    parser.add_argument("--min-games", type=int, default=10,
+                        help="Minimum games played to include")
+    
+    args = parser.parse_args()
+    
+    data_dir = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    
+    # Process players
+    print("\n" + "="*50)
+    print("PROCESSING PLAYERS")
+    print("="*50)
+    
+    df_players = process_players(
+        player_per_game_path=data_dir / "Player Per Game.csv",
+        player_advanced_path=data_dir / "Advanced.csv",
+        output_path=output_dir / "processed_players.csv",
+        min_year=args.min_year,
+        min_games=args.min_games,
+    )
+    
+    print(f"\nProcessed {len(df_players)} player-seasons")
+    print(f"Columns: {list(df_players.columns)}")
+    print(f"\nSample data:")
+    print(df_players[['player_normalized', 'season', 'pts_per_game', 'fppg']].head(10))
+    print(f"\nData types:\n{df_players.dtypes}")
+    
+    # Process teams
+    print("\n" + "="*50)
+    print("PROCESSING TEAMS")
+    print("="*50)
+    
+    df_teams = process_teams(
+        team_stats_path=data_dir / "Team Stats Per Game.csv",
+        team_summaries_path=data_dir / "Team Summaries.csv",
+        output_path=output_dir / "processed_teams.csv",
+        min_year=args.min_year,
+    )
+    
+    if not df_teams.empty:
+        print(f"\nProcessed {len(df_teams)} team-seasons")
+        print(f"Columns: {list(df_teams.columns)}")
+        print(f"\nSample data:")
+        print(df_teams.head(10))
