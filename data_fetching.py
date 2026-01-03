@@ -14,12 +14,6 @@ import time
 from nba_api.stats.endpoints import leaguegamelog, playergamelog
 from nba_api.stats.static import players, teams
 
-"""
-Todo:
-
-Add team stats to game logs, helps in calculating usage rate which in turn helps in model prediction
-"""
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -193,18 +187,168 @@ def calculate_rolling_features(
     
     return df
 
-def calculate_usage_pergame(df: pd.DataFrame) -> float:
+def fetch_team_game_logs(
+    season: str,
+    season_type: str = "Regular Season",
+    rate_limit_delay: float = 1.5
+) -> pd.DataFrame:
     """
-    Calculate minutes per game for each player.
+    Fetch all team game logs for a given season.
 
-    ((FGA + 0.44 * FTA + TOV) * (Team Minutes / 5)) / (Player Minutes * (Team FGA + 0.44 * Team FTA + Team TOV))
-    Make team minutes = 240 (48 minutes * 5 players) for simplicity
+    Args:
+        season: Season string, e.g., "2023-24"
+        season_type: "Regular Season" or "Playoffs"
+        rate_limit_delay: Seconds to wait between API calls
+
+    Returns:
+        DataFrame with team game logs
     """
-    df = df.copy()
-    logger.info("Calculating minutes per game for each player") 
-    usg = ((df['FGA'] + 0.44 * df['FTA'] + df['TOV']) * (240 / 5)) / (df['MIN'] * (df['TEAM_FGA'] + 0.44 * df['TEAM_FTA'] + df['TEAM_TOV']))
-    
-    return usg
+    logger.info(f"Fetching team game logs for {season} ({season_type})")
+
+    time.sleep(rate_limit_delay)
+
+    try:
+        game_log = leaguegamelog.LeagueGameLog(
+            season=season,
+            season_type_all_star=season_type,
+            player_or_team_abbreviation="T",  # Team logs
+        )
+        df = game_log.get_data_frames()[0]
+        logger.info(f"Fetched {len(df)} team game logs for {season}")
+        return df
+
+    except Exception as e:
+        logger.error(f"Error fetching team logs for {season}: {e}")
+        return pd.DataFrame()
+
+
+def fetch_team_stats_multiple_seasons(
+    start_year: int = 2022,
+    end_year: int = 2024,
+    rate_limit_delay: float = 1.5
+) -> pd.DataFrame:
+    """
+    Fetch team game logs for multiple seasons.
+
+    Args:
+        start_year: Starting season year (e.g., 2022 for 2022-23)
+        end_year: Ending season year
+        rate_limit_delay: Seconds between API calls
+
+    Returns:
+        DataFrame with team stats including TEAM_FGA, TEAM_FTA, TEAM_TOV
+    """
+    all_team_logs = []
+
+    for year in range(start_year, end_year + 1):
+        season = f"{year}-{str(year + 1)[-2:]}"
+
+        df = fetch_team_game_logs(season, rate_limit_delay=rate_limit_delay)
+
+        if not df.empty:
+            df['SEASON'] = year
+            all_team_logs.append(df)
+
+    if not all_team_logs:
+        logger.warning("No team game logs fetched!")
+        return pd.DataFrame()
+
+    combined = pd.concat(all_team_logs, ignore_index=True)
+    logger.info(f"Total team game logs fetched: {len(combined)}")
+
+    return combined
+
+
+def merge_team_stats(player_df: pd.DataFrame, team_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge team stats into player game logs for usage rate calculation.
+
+    Joins on GAME_ID and TEAM_ID to get the team's totals for each game.
+
+    Args:
+        player_df: Player game logs DataFrame
+        team_df: Team game logs DataFrame
+
+    Returns:
+        Player DataFrame with team stats columns added
+    """
+    if team_df.empty:
+        logger.warning("Team stats DataFrame is empty, skipping merge")
+        return player_df
+
+    # Select only the columns we need from team stats
+    team_cols = ['GAME_ID', 'TEAM_ID', 'FGA', 'FTA', 'TOV', 'MIN']
+    available_cols = [col for col in team_cols if col in team_df.columns]
+
+    if 'GAME_ID' not in available_cols or 'TEAM_ID' not in available_cols:
+        logger.error("Missing GAME_ID or TEAM_ID in team stats")
+        return player_df
+
+    team_stats = team_df[available_cols].copy()
+
+    # Rename columns to avoid conflicts and indicate they're team stats
+    rename_map = {
+        'FGA': 'TEAM_FGA',
+        'FTA': 'TEAM_FTA',
+        'TOV': 'TEAM_TOV',
+        'MIN': 'TEAM_MIN'
+    }
+    team_stats = team_stats.rename(columns=rename_map)
+
+    # Merge on GAME_ID and TEAM_ID
+    merged = player_df.merge(
+        team_stats,
+        on=['GAME_ID', 'TEAM_ID'],
+        how='left'
+    )
+
+    logger.info(f"Merged team stats: {len(merged)} rows")
+
+    return merged
+
+
+def calculate_usage_rate(df: pd.DataFrame) -> pd.Series:
+    """
+    Calculate usage rate for each player in each game.
+
+    Usage Rate formula from google:
+    100 * ((FGA + 0.44 * FTA + TOV) * (Team MIN / 5)) /
+          (Player MIN * (Team FGA + 0.44 * Team FTA + Team TOV))
+
+    This estimates the percentage of team possessions a player uses while on court.
+
+    Requires columns: FGA, FTA, TOV, MIN, TEAM_FGA, TEAM_FTA, TEAM_TOV
+
+    Returns:
+        Series with usage rate as a percentage (0-100 scale)
+    """
+    required_cols = ['FGA', 'FTA', 'TOV', 'MIN', 'TEAM_FGA', 'TEAM_FTA', 'TEAM_TOV']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+
+    if missing_cols:
+        logger.warning(f"Missing columns for usage rate: {missing_cols}")
+        return pd.Series(np.nan, index=df.index)
+
+    logger.info("Calculating usage rate for each player")
+
+    # Calculate player possessions used
+    player_possessions = df['FGA'] + 0.44 * df['FTA'] + df['TOV']
+
+    # Calculate team possessions (approximately)
+    team_possessions = df['TEAM_FGA'] + 0.44 * df['TEAM_FTA'] + df['TEAM_TOV']
+
+    # Team minutes divided by 5 (5 players on court)
+    team_min_per_player = df.get('TEAM_MIN', 240) / 5
+
+    # Usage rate formula
+    denominator = df['MIN'] * team_possessions
+    usg = np.where(
+        denominator > 0,
+        100 * (player_possessions * team_min_per_player) / denominator,
+        np.nan
+    )
+
+    return pd.Series(usg, index=df.index)
 
 
 def calculate_season_to_date_features(
@@ -213,9 +357,9 @@ def calculate_season_to_date_features(
 ) -> pd.DataFrame:
     """
     Calculate season-to-date averages for each player.
-
-    IMPORTANT: Uses expanding window with shift(1) to avoid data leakage -
-    averages are calculated from all PREVIOUS games in the season,
+    
+    Uses expanding window with shift(1) to avoid data leakage 
+    Averages are calculated from all PREVIOUS games in the season,
     not including the current game.
 
     For early season games with few prior games, these values will be based
@@ -390,7 +534,23 @@ def process_game_logs(
     
     # Game number
     df = add_game_number(df)
-    
+
+    # Usage rate 
+    # Merge team stats first
+    if 'TEAM_FGA' in df.columns:
+        df['usage_rate'] = calculate_usage_rate(df)
+
+        # Calculate rolling usage rate (last 3 and last 5 games)
+        logger.info("Calculating rolling usage rate averages")
+        for window in [3, 5]:
+            col_name = f"usage_rate_last_{window}"
+            df[col_name] = (
+                df.groupby('PLAYER_ID')['usage_rate']
+                .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+            )
+    else:
+        logger.info("Team stats not available, skipping usage rate calculation")
+
     # Normalize player name for joining with processed_players.csv
     if 'PLAYER_NAME' in df.columns:
         df['player_normalized'] = df['PLAYER_NAME'].str.lower().str.strip()
@@ -433,6 +593,11 @@ def process_game_logs(
             rolling_cols[col_name] = col_name  # already correct name
         rolling_cols[f"fppg_last_{window}"] = f"fppg_last_{window}"
 
+    # Rolling usage rate features
+    for window in [3, 5]:
+        col_name = f"usage_rate_last_{window}"
+        rolling_cols[col_name] = col_name
+
     # Season-to-date features (model features)
     season_avg_cols = {}
     for stat in ['pts', 'reb', 'ast', 'stl', 'blk', 'tov', 'min', 'fg_pct']:
@@ -446,6 +611,7 @@ def process_game_logs(
         'is_home': 'is_home',
         'rest_days': 'rest_days',
         'game_number': 'game_number',
+        'usage_rate': 'usage_rate',
     }
     
     # Combine all column mappings
@@ -466,32 +632,51 @@ def fetch_and_process(
     end_year: int = 2024,
     output_path: str = "./data/processed/game_logs_features.csv",
     rate_limit_delay: float = 1.5,
-    rolling_windows: List[int] = [3, 5, 10]
+    rolling_windows: List[int] = [3, 5, 10],
+    include_team_stats: bool = True
 ) -> pd.DataFrame:
     """
     Full pipeline: fetch from API, process, and save.
+
+    Args:
+        start_year: Starting season year
+        end_year: Ending season year
+        output_path: Path to save processed data
+        rate_limit_delay: Seconds between API calls
+        rolling_windows: Windows for rolling averages
+        include_team_stats: Whether to fetch and merge team stats for usage rate
     """
-    # Fetch
+    # Fetch player game logs
     df = fetch_multiple_seasons(
         start_year=start_year,
         end_year=end_year,
         rate_limit_delay=rate_limit_delay
     )
-    
+
     if df.empty:
         logger.error("No data fetched, exiting")
         return pd.DataFrame()
-    
+
+    # Fetch and merge team stats if requested
+    if include_team_stats:
+        logger.info("Fetching team stats for usage rate calculation...")
+        team_df = fetch_team_stats_multiple_seasons(
+            start_year=start_year,
+            end_year=end_year,
+            rate_limit_delay=rate_limit_delay
+        )
+        df = merge_team_stats(df, team_df)
+
     # Process
     df = process_game_logs(df, rolling_windows=rolling_windows)
-    
+
     # Save
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Saving to {output_path}")    
+
+    logger.info(f"Saving to {output_path}")
     df.to_csv(output_path, index=False)
-    
+
     return df
 
 
