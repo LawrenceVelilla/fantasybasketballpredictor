@@ -170,7 +170,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Fetch position defense stats")
-    parser.add_argument("--start-year", type=int, default=2022,
+    parser.add_argument("--start-year", type=int, default=2020,
                         help="Starting season year")
     parser.add_argument("--end-year", type=int, default=2025,
                         help="Ending season year")

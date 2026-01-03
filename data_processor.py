@@ -393,7 +393,7 @@ if __name__ == "__main__":
                         help="Directory containing Kaggle CSVs")
     parser.add_argument("--output-dir", type=str, default="./data/processed",
                         help="Output directory for processed files")
-    parser.add_argument("--min-year", type=int, default=2022,
+    parser.add_argument("--min-year", type=int, default=2020,
                         help="Minimum season year to include")
     parser.add_argument("--min-games", type=int, default=10,
                         help="Minimum games played to include")

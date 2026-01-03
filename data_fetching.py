@@ -725,15 +725,26 @@ def fetch_player_recent_games(
             season_type_all_star="Regular Season"
         )
         df = game_log.get_data_frames()[0]
-        
+
         # Take most recent n games
         df = df.head(n_games)
-        
+
+        # Add PLAYER_ID if missing (PlayerGameLog might not include it)
+        if 'PLAYER_ID' not in df.columns:
+            df['PLAYER_ID'] = player_id
+
+        # Add SEASON if missing
+        if 'SEASON' not in df.columns:
+            # Extract year from season string (e.g., "2024-25" -> 2024)
+            season_year = int(season.split('-')[0])
+            df['SEASON'] = season_year
+
+        logger.info("Processing game logs...")
         # Process features
-        df = process_game_logs(df, rolling_windows=[5])
-        
+        df = process_game_logs(df, rolling_windows=[3, 5])
+
         return df
-    
+
     except Exception as e:
         logger.error(f"Error fetching games for {player_name}: {e}")
         return pd.DataFrame()
@@ -743,14 +754,14 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Fetch and process NBA game logs")
-    parser.add_argument("--start-year", type=int, default=2022,
+    parser.add_argument("--start-year", type=int, default=2020,
                         help="Starting season year")
-    parser.add_argument("--end-year", type=int, default=2024,
+    parser.add_argument("--end-year", type=int, default=2025,
                         help="Ending season year")
     parser.add_argument("--output", type=str, 
                         default="./data/processed/game_logs_features.csv",
                         help="Output path (.csv or .parquet)")
-    parser.add_argument("--delay", type=float, default=0.6,
+    parser.add_argument("--delay", type=float, default=1.5,
                         help="Rate limit delay in seconds")
     
     args = parser.parse_args()
