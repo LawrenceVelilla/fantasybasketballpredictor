@@ -28,16 +28,17 @@ logger = logging.getLogger(__name__)
 ROLLING_FEATURES = [
     'pts_last_5', 'reb_last_5', 'ast_last_5',
     'stl_last_5', 'blk_last_5', 'tov_last_5',
-    'min_last_5', 'fppg_last_3', 'fppg_last_5', # Removed 'fppg_last_5' and score went up a little
+    'min_last_5', 'fppg_last_3', 'fppg_last_5',
     'min_last_3', 'pts_last_3', 'reb_last_3',
-    'ast_last_3', 'stl_last_3', 'blk_last_3', 'tov_last_3'
+    'ast_last_3', 'stl_last_3', 'blk_last_3', 'tov_last_3',
+    'usage_rate_last_3', 'usage_rate_last_5',
 ]
 
 # Season-to-date features (from game_logs_features.csv - dynamic, no leakage)
 SEASON_TO_DATE_FEATURES = [
     'pts_season_avg', 'reb_season_avg', 'ast_season_avg',
     'stl_season_avg', 'blk_season_avg', 'tov_season_avg', 'min_season_avg',
-    'fppg_season_avg', 'games_played_season',
+    'fppg_season_avg', 'games_played_season', 'usage_rate'
 ]
 
 # Baseline features (from processed_players.csv - last season's stats)
@@ -372,32 +373,13 @@ def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     weights: Optional[np.ndarray] = None,
-    **xgb_params
 ) -> XGBRegressor:
     """Train XGBoost regressor."""
     
-    # Default parameters (reasonable for MVP)
-    default_params = {
-        'n_estimators': 1000,
-        'max_depth': 6,
-        'learning_rate': 0.01,
-        'subsample': 0.8,
-        'colsample_bytree': 0.001,
-        'random_state': 42,
-        'n_jobs': -1,
-        'objective': 'reg:squarederror',
-    }
-
-    
-    # Override with any provided params
-    params = {**default_params, **xgb_params}
-    
-    logger.info(f"Training XGBoost with params: {params}")
-    
-    model = XGBRegressor(**params)
+    model = XGBRegressor(n_estimators=1000, max_depth=6, learning_rate=0.01, subsample=0.8, 
+                            colsample_bytree=0.001, random_state=42, n_jobs=-1, objective='reg:squarederror')
     model.fit(X_train, y_train)
     
-    logger.info("Training complete!")
     
     return model
 
@@ -640,25 +622,289 @@ def save_model(
 
 def load_model(model_path: str | Path) -> Tuple[XGBRegressor, List[str]]:
     """Load model and feature names."""
-    
+
     model_path = Path(model_path)
-    
+
     # Load model
     model = joblib.load(model_path.with_suffix('.joblib'))
-    
+
     features_path = model_path.with_suffix('.features.txt')
     if features_path.exists():
         with open(features_path, 'r') as f:
             feature_names = f.read().strip().split('\n')
     else:
         feature_names = []
-    
+
     return model, feature_names
 
 
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
+def predict_next_game(
+    player_name: str,
+    opponent: str,
+    is_home: bool = True,
+    model_path: str = "./models/fantasy_predictor",
+    data_dir: str = "./data/processed",
+) -> dict:
+    """
+    Predict a player's fantasy points for their next game.
+
+    Args:
+        player_name: Player's full name (e.g., "LeBron James")
+        opponent: Opponent team abbreviation (e.g., "GSW")
+        is_home: Whether the game is at home
+        model_path: Path to trained model
+        data_dir: Directory with processed data
+
+    Returns:
+        dict with prediction and player info
+    """
+    from data_fetching import fetch_player_recent_games
+
+    logger.info(f"Predicting next game for {player_name} vs {opponent}")
+
+    # Load model
+    model, feature_names = load_model(model_path)
+
+    # Fetch recent games to calculate rolling features
+    recent_games = fetch_player_recent_games(player_name, n_games=10)
+
+    if recent_games.empty:
+        logger.error(f"Could not fetch recent games for {player_name}")
+        return {}
+
+    # Get most recent game's features (has rolling averages)
+    latest_game = recent_games.iloc[0].copy()
+
+    # Load baseline and matchup data
+    data_dir = Path(data_dir)
+    players = pd.read_csv(data_dir / "processed_players.csv")
+    teams = pd.read_csv(data_dir / "processed_teams.csv")
+
+    # Get current season
+    from datetime import datetime
+    current_year = datetime.now().year
+    current_month = datetime.now().month
+    current_season = current_year if current_month >= 10 else current_year - 1
+
+    # Get player baseline stats
+    player_normalized = player_name.lower().strip()
+    player_baseline = players[
+        (players['player_normalized'] == player_normalized) &
+        (players['season'] == current_season - 1)
+    ]
+
+    # Build feature row
+    features = {}
+
+    # Copy rolling features from latest game
+    for feat in ROLLING_FEATURES:
+        if feat in latest_game:
+            features[feat] = latest_game[feat]
+        else:
+            features[feat] = np.nan
+
+    # Copy season-to-date features
+    for feat in SEASON_TO_DATE_FEATURES:
+        if feat in latest_game:
+            features[feat] = latest_game[feat]
+        elif not player_baseline.empty and feat.replace('_season_avg', '_per_game') in player_baseline.columns:
+            # Fallback to baseline
+            baseline_col = feat.replace('_season_avg', '_per_game').replace('reb', 'trb')
+            if baseline_col in player_baseline.columns:
+                features[feat] = player_baseline[baseline_col].iloc[0]
+            else:
+                features[feat] = np.nan
+        else:
+            features[feat] = np.nan
+
+    # Get opponent stats
+    opp_stats = teams[
+        (teams['team'] == opponent) &
+        (teams['season'] == current_season - 1)
+    ]
+
+    if not opp_stats.empty:
+        features['opp_drtg'] = opp_stats['team_drtg'].iloc[0]
+        features['opp_pace'] = opp_stats['team_pace'].iloc[0]
+    else:
+        features['opp_drtg'] = np.nan
+        features['opp_pace'] = np.nan
+
+    # Get player's team pace
+    if 'team' in latest_game:
+        team_stats = teams[
+            (teams['team'] == latest_game['team']) &
+            (teams['season'] == current_season - 1)
+        ]
+        if not team_stats.empty:
+            features['team_pace'] = team_stats['team_pace'].iloc[0]
+        else:
+            features['team_pace'] = np.nan
+    else:
+        features['team_pace'] = np.nan
+
+    # Position defense (need position)
+    if not player_baseline.empty and 'pos' in player_baseline.columns:
+        pos = player_baseline['pos'].iloc[0]
+        primary_pos = str(pos).split('-')[0].strip()
+        pos_map = {'PG': 'PG', 'SG': 'SG', 'SF': 'SF', 'PF': 'PF', 'C': 'C', 'G': 'PG', 'F': 'SF'}
+        primary_pos = pos_map.get(primary_pos, 'SF')
+
+        # Position one-hot
+        features['is_pg'] = 1 if primary_pos == 'PG' else 0
+        features['is_sg'] = 1 if primary_pos == 'SG' else 0
+        features['is_sf'] = 1 if primary_pos == 'SF' else 0
+        features['is_pf'] = 1 if primary_pos == 'PF' else 0
+        features['is_c'] = 1 if primary_pos == 'C' else 0
+
+        # Position defense
+        if (data_dir / "team_vs_position_defense.csv").exists():
+            pos_def = pd.read_csv(data_dir / "team_vs_position_defense.csv")
+            pos_def_row = pos_def[
+                (pos_def['team'] == opponent) &
+                (pos_def['season'] == current_season - 1) &
+                (pos_def['position'] == primary_pos)
+            ]
+            if not pos_def_row.empty:
+                features['opp_pos_fg_pct'] = pos_def_row['opp_pos_fg_pct'].iloc[0]
+                features['opp_pos_fg_diff'] = pos_def_row['opp_pos_fg_diff'].iloc[0]
+            else:
+                features['opp_pos_fg_pct'] = np.nan
+                features['opp_pos_fg_diff'] = np.nan
+        else:
+            features['opp_pos_fg_pct'] = np.nan
+            features['opp_pos_fg_diff'] = np.nan
+    else:
+        # No position info
+        features['is_pg'] = 0
+        features['is_sg'] = 0
+        features['is_sf'] = 0
+        features['is_pf'] = 0
+        features['is_c'] = 0
+        features['opp_pos_fg_pct'] = np.nan
+        features['opp_pos_fg_diff'] = np.nan
+
+    # Situational
+    features['is_back_to_back'] = 0  # Assume not back-to-back unless specified
+
+    # Create DataFrame with correct feature order
+    X = pd.DataFrame([features])[feature_names]
+
+    # Make prediction
+    prediction = model.predict(X)[0]
+
+    result = {
+        'player': player_name,
+        'opponent': opponent,
+        'is_home': is_home,
+        'predicted_fpts': round(prediction, 1),
+        'season_avg': round(features.get('fppg_season_avg', 0), 1),
+        'last_5_avg': round(features.get('fppg_last_5', 0), 1),
+    }
+
+    logger.info(f"Prediction: {result['predicted_fpts']} fpts")
+
+    return result
+
+
+def evaluate_player(
+    player_name: str,
+    test_season: int = 2024,
+    data_dir: str = "./data/processed",
+    model_path: str = "./models/fantasy_predictor",
+) -> pd.DataFrame:
+    """
+    Evaluate model predictions for a specific player on the test set.
+    Shows actual vs predicted with detailed metrics.
+
+    Args:
+        player_name: Player's name (partial match OK)
+        test_season: Season to evaluate
+        data_dir: Directory with processed data
+        model_path: Path to trained model
+
+    Returns:
+        DataFrame with game-by-game predictions and actual values
+    """
+    logger.info(f"Evaluating {player_name} for {test_season} season")
+
+    # Load model
+    model, feature_names = load_model(model_path)
+
+    # Load data
+    data_dir = Path(data_dir)
+    game_logs, players, teams, position_defense = load_data(
+        data_dir / "game_logs_features.csv",
+        data_dir / "processed_players.csv",
+        data_dir / "processed_teams.csv",
+        data_dir / "team_vs_position_defense.csv",
+    )
+
+    # Merge data
+    df = merge_data(game_logs, players, teams, position_defense)
+    df = fill_season_to_date_with_baseline(df)
+
+    # Filter for player and test season
+    player_normalized = player_name.lower().strip()
+    mask = (
+        df['player_normalized'].str.contains(player_normalized, na=False) &
+        (df['season'] == test_season)
+    )
+
+    if mask.sum() == 0:
+        logger.error(f"No games found for '{player_name}' in {test_season}")
+        return pd.DataFrame()
+
+    player_df = df[mask].copy()
+
+    # Prepare features and predict
+    X = player_df[feature_names].copy()
+    y_true = player_df[TARGET].copy()
+
+    player_df['predicted_fpts'] = model.predict(X)
+    player_df['error'] = y_true - player_df['predicted_fpts']
+    player_df['abs_error'] = player_df['error'].abs()
+
+    # Calculate metrics
+    mae = mean_absolute_error(y_true, player_df['predicted_fpts'])
+    rmse = np.sqrt(mean_squared_error(y_true, player_df['predicted_fpts']))
+    r2 = r2_score(y_true, player_df['predicted_fpts'])
+
+    # Display
+    print(f"\n{'='*80}")
+    print(f"PLAYER EVALUATION: {player_name.upper()} ({test_season})")
+    print(f"{'='*80}\n")
+
+    display_cols = ['game_date', 'opponent', 'is_home', TARGET, 'predicted_fpts', 'error', 'abs_error']
+    display_cols = [c for c in display_cols if c in player_df.columns]
+
+    display_df = player_df[display_cols].copy()
+    display_df['predicted_fpts'] = display_df['predicted_fpts'].round(1)
+    display_df['error'] = display_df['error'].round(1)
+    display_df['abs_error'] = display_df['abs_error'].round(1)
+
+    # Rename for display
+    display_df = display_df.rename(columns={
+        TARGET: 'actual_fpts',
+        'game_date': 'date',
+    })
+
+    print(display_df.to_string(index=False))
+
+    # Summary
+    print(f"\n{'='*80}")
+    print(f"SUMMARY STATISTICS")
+    print(f"{'='*80}")
+    print(f"  Games Played:     {len(player_df)}")
+    print(f"  Actual Avg:       {y_true.mean():.1f} fpts")
+    print(f"  Predicted Avg:    {player_df['predicted_fpts'].mean():.1f} fpts")
+    print(f"  MAE:              {mae:.2f} fpts")
+    print(f"  RMSE:             {rmse:.2f} fpts")
+    print(f"  R²:               {r2:.3f}")
+    print(f"  Bias:             {player_df['error'].mean():+.1f} (positive = underpredicting)")
+    print(f"{'='*80}\n")
+
+    return display_df
 
 def train_pipeline(
     game_logs_path: str = "./data/processed/game_logs_features.csv",
