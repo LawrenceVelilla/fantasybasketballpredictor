@@ -629,8 +629,8 @@ def process_game_logs(
 
 def fetch_and_process(
     start_year: int = 2022,
-    end_year: int = 2024,
-    output_path: str = "./data/processed/game_logs_features.csv",
+    end_year: int = 2025,
+    output_path: str | Path = Path(__file__).resolve().parent / "data" / "processed" / "game_logs_features.csv",
     rate_limit_delay: float = 1.5,
     rolling_windows: List[int] = [3, 5, 10],
     include_team_stats: bool = True
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     parser.add_argument("--end-year", type=int, default=2025,
                         help="Ending season year")
     parser.add_argument("--output", type=str, 
-                        default="./data/processed/game_logs_features.csv",
+                        default=str(Path(__file__).resolve().parent / "data" / "processed" / "game_logs_features.csv"),
                         help="Output path (.csv or .parquet)")
     parser.add_argument("--delay", type=float, default=1.5,
                         help="Rate limit delay in seconds")

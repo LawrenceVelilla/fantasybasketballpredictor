@@ -2,6 +2,8 @@
 inference.py
 Production inference for fantasy basketball predictions.
 
+python3 -m engine.inference
+
 This module handles:
 - Loading trained models
 - Predicting next game for players (webapp/API)
@@ -19,11 +21,19 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from nba_api.stats.endpoints import playernextngames
 from nba_api.stats.static import players as nba_players
 
-from training import (
+
+from .training import (
     load_data, merge_data, fill_season_to_date_with_baseline,
     prepare_features, TARGET,
     ROLLING_FEATURES, SEASON_TO_DATE_FEATURES,
 )
+from .features import (
+    get_current_season, get_player_position, build_prediction_features
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = BASE_DIR / "data" / "processed"
+DEFAULT_MODEL_PATH = BASE_DIR / "models" / "fantasy_predictor"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,11 +57,12 @@ def load_model(model_path: str | Path) -> Tuple[XGBRegressor, List[str]]:
     return model, feature_names
 
 
+
 def predict_player_next_n_games(
     player_name: str,
     n_games: int = 3,
-    model_path: str = "./models/fantasy_predictor",
-    data_dir: str = "./data/processed",
+    model_path: str | Path = DEFAULT_MODEL_PATH,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
 ) -> pd.DataFrame:
     """
     Predict a player's fantasy points for their next N upcoming games.
@@ -76,10 +87,15 @@ def predict_player_next_n_games(
 
     if not player:
         logger.error(f"Player '{player_name}' not found in NBA API")
+        # Try partial match
+        partial_matches = [p for p in all_players if player_name.lower() in p['full_name'].lower()]
+        if partial_matches:
+            logger.info(f"Did you mean one of these? {[p['full_name'] for p in partial_matches[:5]]}")
         return pd.DataFrame()
 
     player_id = player[0]['id']
-    logger.info(f"Found player ID: {player_id} for {player_name}")
+    actual_player_name = player[0]['full_name']  # Use exact name from API
+    logger.info(f"Found player: {actual_player_name} (ID: {player_id})")
 
     # Fetch next N games schedule from NBA API (only for opponent/date info)
     try:
@@ -113,148 +129,88 @@ def predict_player_next_n_games(
     logger.info(f"Loading cached game logs from {game_logs_path}")
     game_logs = pd.read_csv(game_logs_path)
 
-    # Filter for this player's recent games
-    player_normalized = player_name.lower().strip()
+    # Filter for this player's recent games (use actual name from API)
+    player_normalized = actual_player_name.lower().strip()
     player_games = game_logs[
         game_logs['player_normalized'] == player_normalized
     ].sort_values('game_date', ascending=False).head(20)  # Get last 20 games for safety
 
     if player_games.empty:
-        logger.error(f"No recent games found for {player_name} in cached game logs")
+        logger.error(f"No recent games found for {actual_player_name} in cached game logs")
+        logger.info(f"Available players in cache: {game_logs['player_normalized'].unique()[:10]}")
         return pd.DataFrame()
+
+    # Verify we got the right player
+    found_player_name = player_games.iloc[0].get('player_name', 'Unknown')
+    logger.info(f"Found {len(player_games)} recent games for {found_player_name}")
 
     # Get most recent game's features (has rolling averages and season-to-date stats)
     latest_game = player_games.iloc[0].copy()
     logger.info(f"Using features from most recent game: {latest_game.get('game_date', 'Unknown')}")
 
-    # Load baseline and matchup data
-    data_dir = Path(data_dir)
+    # Extract player's recent stats (rolling + season-to-date)
+    player_recent_stats = {}
+    for feat in ROLLING_FEATURES + SEASON_TO_DATE_FEATURES:
+        player_recent_stats[feat] = latest_game.get(feat, np.nan)
+
+    # Get player's team from latest game
+    player_team = latest_game.get('team', None)
+    if not player_team:
+        logger.error("Could not determine player's team from recent games")
+        return pd.DataFrame()
+
+    # Load matchup data
     players_df = pd.read_csv(data_dir / "processed_players.csv")
-    teams = pd.read_csv(data_dir / "processed_teams.csv")
-
-    # Get current season
-    from datetime import datetime
-    current_year = datetime.now().year
-    current_month = datetime.now().month
-    current_season = current_year if current_month >= 10 else current_year - 1
-
-    # Get player baseline stats
-    player_normalized = player_name.lower().strip()
-    player_baseline = players_df[
-        (players_df['player_normalized'] == player_normalized) &
-        (players_df['season'] == current_season - 1)
-    ]
-
-    # Get position info
-    if not player_baseline.empty and 'pos' in player_baseline.columns:
-        pos = player_baseline['pos'].iloc[0]
-        primary_pos = str(pos).split('-')[0].strip()
-        pos_map = {'PG': 'PG', 'SG': 'SG', 'SF': 'SF', 'PF': 'PF', 'C': 'C', 'G': 'PG', 'F': 'SF'}
-        primary_pos = pos_map.get(primary_pos, 'SF')
-    else:
-        primary_pos = 'SF'
+    teams_df = pd.read_csv(data_dir / "processed_teams.csv")
 
     # Load position defense data if available
     pos_def_df = None
     if (data_dir / "team_vs_position_defense.csv").exists():
         pos_def_df = pd.read_csv(data_dir / "team_vs_position_defense.csv")
 
+    # Get current season and player position
+    current_season = get_current_season()
+    player_position = get_player_position(actual_player_name, players_df, current_season - 1)
+    logger.info(f"Player position: {player_position}, Team: {player_team}")
+
     # Predict for each upcoming game
     predictions = []
 
-    for idx, game_row in upcoming_games_df.iterrows():
-        # Extract opponent team abbreviation
-        matchup = game_row.get('VISITOR_TEAM_ABBREVIATION') or game_row.get('HOME_TEAM_ABBREVIATION')
+    for _, game_row in upcoming_games_df.iterrows():
         game_date = game_row.get('GAME_DATE', 'Unknown')
-        is_home = '@' not in str(game_row.get('MATCHUP', ''))
+        home_team = game_row.get('HOME_TEAM_ABBREVIATION', '')
+        visitor_team = game_row.get('VISITOR_TEAM_ABBREVIATION', '')
 
-        # If the game info has VS_TEAM_ABBREVIATION (more common format)
-        if 'VS_TEAM_ABBREVIATION' in game_row:
-            opponent = game_row['VS_TEAM_ABBREVIATION']
-        elif 'VISITOR_TEAM_ABBREVIATION' in game_row:
-            opponent = game_row['VISITOR_TEAM_ABBREVIATION']
-        elif 'HOME_TEAM_ABBREVIATION' in game_row:
-            opponent = game_row['HOME_TEAM_ABBREVIATION']
+        # Determine if player's team is home or away, and who the opponent is
+        if player_team == home_team:
+            # Player is home team
+            is_home = True
+            opponent = visitor_team
+        elif player_team == visitor_team:
+            # Player is away team
+            is_home = False
+            opponent = home_team
         else:
+            logger.warning(f"Player team '{player_team}' doesn't match home '{home_team}' or visitor '{visitor_team}'")
+            continue
+
+        if not opponent:
             logger.warning(f"Could not determine opponent for game on {game_date}")
             continue
 
-        # Build feature row
-        features = {}
+        logger.info(f"  {game_date}: {player_team} {'vs' if is_home else '@'} {opponent}")
 
-        # Copy rolling features from latest game
-        for feat in ROLLING_FEATURES:
-            if feat in latest_game:
-                features[feat] = latest_game[feat]
-            else:
-                features[feat] = np.nan
-
-        # Copy season-to-date features
-        for feat in SEASON_TO_DATE_FEATURES:
-            if feat in latest_game:
-                features[feat] = latest_game[feat]
-            elif not player_baseline.empty:
-                # Fallback to baseline
-                baseline_col = feat.replace('_season_avg', '_per_game').replace('reb', 'trb')
-                if baseline_col in player_baseline.columns:
-                    features[feat] = player_baseline[baseline_col].iloc[0]
-                else:
-                    features[feat] = np.nan
-            else:
-                features[feat] = np.nan
-
-        # Get opponent stats
-        opp_stats = teams[
-            (teams['team'] == opponent) &
-            (teams['season'] == current_season - 1)
-        ]
-
-        if not opp_stats.empty:
-            features['opp_drtg'] = opp_stats['team_drtg'].iloc[0]
-            features['opp_pace'] = opp_stats['team_pace'].iloc[0]
-        else:
-            features['opp_drtg'] = np.nan
-            features['opp_pace'] = np.nan
-
-        # Get player's team pace
-        if 'team' in latest_game:
-            team_stats = teams[
-                (teams['team'] == latest_game['team']) &
-                (teams['season'] == current_season - 1)
-            ]
-            if not team_stats.empty:
-                features['team_pace'] = team_stats['team_pace'].iloc[0]
-            else:
-                features['team_pace'] = np.nan
-        else:
-            features['team_pace'] = np.nan
-
-        # Position one-hot encoding
-        features['is_pg'] = 1 if primary_pos == 'PG' else 0
-        features['is_sg'] = 1 if primary_pos == 'SG' else 0
-        features['is_sf'] = 1 if primary_pos == 'SF' else 0
-        features['is_pf'] = 1 if primary_pos == 'PF' else 0
-        features['is_c'] = 1 if primary_pos == 'C' else 0
-
-        # Position defense
-        if pos_def_df is not None:
-            pos_def_row = pos_def_df[
-                (pos_def_df['team'] == opponent) &
-                (pos_def_df['season'] == current_season - 1) &
-                (pos_def_df['position'] == primary_pos)
-            ]
-            if not pos_def_row.empty:
-                features['opp_pos_fg_pct'] = pos_def_row['opp_pos_fg_pct'].iloc[0]
-                features['opp_pos_fg_diff'] = pos_def_row['opp_pos_fg_diff'].iloc[0]
-            else:
-                features['opp_pos_fg_pct'] = np.nan
-                features['opp_pos_fg_diff'] = np.nan
-        else:
-            features['opp_pos_fg_pct'] = np.nan
-            features['opp_pos_fg_diff'] = np.nan
-
-        # Situational features
-        features['is_back_to_back'] = 0  # TODO: Calculate from game dates
+        # Build features using shared utility function
+        features = build_prediction_features(
+            player_recent_stats=player_recent_stats,
+            opponent=opponent,
+            player_team=player_team,
+            position=player_position,
+            teams_df=teams_df,
+            pos_def_df=pos_def_df,
+            season=current_season - 1,  # Use last season's team/matchup data
+            is_back_to_back=False,  # TODO: Calculate from game dates
+        )
 
         # Create DataFrame with correct feature order
         X = pd.DataFrame([features])[feature_names]
@@ -264,7 +220,7 @@ def predict_player_next_n_games(
 
         # Store result
         predictions.append({
-            'player': player_name,
+            'player': actual_player_name,
             'game_date': game_date,
             'opponent': opponent,
             'is_home': is_home,
@@ -277,7 +233,7 @@ def predict_player_next_n_games(
     results_df = pd.DataFrame(predictions)
 
     if not results_df.empty:
-        logger.info(f"\nPredictions for {player_name}:")
+        logger.info(f"\nPredictions for {actual_player_name}:")
         logger.info(f"\n{results_df.to_string(index=False)}")
 
     return results_df
@@ -287,11 +243,14 @@ def predict_next_game(
     player_name: str,
     opponent: str,
     is_home: bool = True,
-    model_path: str = "./models/fantasy_predictor",
-    data_dir: str = "./data/processed",
+    model_path: str | Path = DEFAULT_MODEL_PATH,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
 ) -> dict:
     """
-    Predict a player's fantasy points for their next game.
+    Predict a player's fantasy points for a specific matchup.
+
+    Uses cached game logs for efficiency. Simpler alternative to predict_player_next_n_games
+    when you already know the opponent.
 
     Args:
         player_name: Player's full name (e.g., "LeBron James")
@@ -303,139 +262,72 @@ def predict_next_game(
     Returns:
         dict with prediction and player info
     """
-    from data_fetching import fetch_player_recent_games
-
     logger.info(f"Predicting next game for {player_name} vs {opponent}")
 
     # Load model
     model, feature_names = load_model(model_path)
 
-    # Fetch recent games to calculate rolling features
-    recent_games = fetch_player_recent_games(player_name, n_games=10)
+    # Load cached game logs
+    data_dir = Path(data_dir)
+    game_logs_path = data_dir / "game_logs_features.csv"
 
-    if recent_games.empty:
-        logger.error(f"Could not fetch recent games for {player_name}")
+    if not game_logs_path.exists():
+        logger.error(f"Game logs not found at {game_logs_path}")
         return {}
 
-    # Get most recent game's features (has rolling averages)
-    latest_game = recent_games.iloc[0].copy()
+    game_logs = pd.read_csv(game_logs_path)
 
-    # Load baseline and matchup data
-    data_dir = Path(data_dir)
-    players = pd.read_csv(data_dir / "processed_players.csv")
-    teams = pd.read_csv(data_dir / "processed_teams.csv")
-
-    # Get current season
-    from datetime import datetime
-    current_year = datetime.now().year
-    current_month = datetime.now().month
-    current_season = current_year if current_month >= 10 else current_year - 1
-
-    # Get player baseline stats
+    # Get player's recent games
     player_normalized = player_name.lower().strip()
-    player_baseline = players[
-        (players['player_normalized'] == player_normalized) &
-        (players['season'] == current_season - 1)
-    ]
+    player_games = game_logs[
+        game_logs['player_normalized'] == player_normalized
+    ].sort_values('game_date', ascending=False).head(10)
 
-    # Build feature row
-    features = {}
+    if player_games.empty:
+        logger.error(f"No recent games found for {player_name}")
+        return {}
 
-    # Copy rolling features from latest game
-    for feat in ROLLING_FEATURES:
-        if feat in latest_game:
-            features[feat] = latest_game[feat]
-        else:
-            features[feat] = np.nan
+    # Get latest game features
+    latest_game = player_games.iloc[0].copy()
 
-    # Copy season-to-date features
-    for feat in SEASON_TO_DATE_FEATURES:
-        if feat in latest_game:
-            features[feat] = latest_game[feat]
-        elif not player_baseline.empty and feat.replace('_season_avg', '_per_game') in player_baseline.columns:
-            # Fallback to baseline
-            baseline_col = feat.replace('_season_avg', '_per_game').replace('reb', 'trb')
-            if baseline_col in player_baseline.columns:
-                features[feat] = player_baseline[baseline_col].iloc[0]
-            else:
-                features[feat] = np.nan
-        else:
-            features[feat] = np.nan
+    # Extract player's recent stats
+    player_recent_stats = {}
+    for feat in ROLLING_FEATURES + SEASON_TO_DATE_FEATURES:
+        player_recent_stats[feat] = latest_game.get(feat, np.nan)
 
-    # Get opponent stats
-    opp_stats = teams[
-        (teams['team'] == opponent) &
-        (teams['season'] == current_season - 1)
-    ]
+    # Get player's team
+    player_team = latest_game.get('team', None)
+    if not player_team:
+        logger.error("Could not determine player's team")
+        return {}
 
-    if not opp_stats.empty:
-        features['opp_drtg'] = opp_stats['team_drtg'].iloc[0]
-        features['opp_pace'] = opp_stats['team_pace'].iloc[0]
-    else:
-        features['opp_drtg'] = np.nan
-        features['opp_pace'] = np.nan
+    # Load matchup data
+    players_df = pd.read_csv(data_dir / "processed_players.csv")
+    teams_df = pd.read_csv(data_dir / "processed_teams.csv")
 
-    # Get player's team pace
-    if 'team' in latest_game:
-        team_stats = teams[
-            (teams['team'] == latest_game['team']) &
-            (teams['season'] == current_season - 1)
-        ]
-        if not team_stats.empty:
-            features['team_pace'] = team_stats['team_pace'].iloc[0]
-        else:
-            features['team_pace'] = np.nan
-    else:
-        features['team_pace'] = np.nan
+    # Load position defense if available
+    pos_def_df = None
+    if (data_dir / "team_vs_position_defense.csv").exists():
+        pos_def_df = pd.read_csv(data_dir / "team_vs_position_defense.csv")
 
-    # Position defense (need position)
-    if not player_baseline.empty and 'pos' in player_baseline.columns:
-        pos = player_baseline['pos'].iloc[0]
-        primary_pos = str(pos).split('-')[0].strip()
-        pos_map = {'PG': 'PG', 'SG': 'SG', 'SF': 'SF', 'PF': 'PF', 'C': 'C', 'G': 'PG', 'F': 'SF'}
-        primary_pos = pos_map.get(primary_pos, 'SF')
+    # Get current season and position
+    current_season = get_current_season()
+    player_position = get_player_position(player_name, players_df, current_season - 1)
 
-        # Position one-hot
-        features['is_pg'] = 1 if primary_pos == 'PG' else 0
-        features['is_sg'] = 1 if primary_pos == 'SG' else 0
-        features['is_sf'] = 1 if primary_pos == 'SF' else 0
-        features['is_pf'] = 1 if primary_pos == 'PF' else 0
-        features['is_c'] = 1 if primary_pos == 'C' else 0
+    # Build features using shared utility
+    features = build_prediction_features(
+        player_recent_stats=player_recent_stats,
+        opponent=opponent,
+        player_team=player_team,
+        position=player_position,
+        teams_df=teams_df,
+        pos_def_df=pos_def_df,
+        season=current_season - 1,
+        is_back_to_back=False,
+    )
 
-        # Position defense
-        if (data_dir / "team_vs_position_defense.csv").exists():
-            pos_def = pd.read_csv(data_dir / "team_vs_position_defense.csv")
-            pos_def_row = pos_def[
-                (pos_def['team'] == opponent) &
-                (pos_def['season'] == current_season - 1) &
-                (pos_def['position'] == primary_pos)
-            ]
-            if not pos_def_row.empty:
-                features['opp_pos_fg_pct'] = pos_def_row['opp_pos_fg_pct'].iloc[0]
-                features['opp_pos_fg_diff'] = pos_def_row['opp_pos_fg_diff'].iloc[0]
-            else:
-                features['opp_pos_fg_pct'] = np.nan
-                features['opp_pos_fg_diff'] = np.nan
-        else:
-            features['opp_pos_fg_pct'] = np.nan
-            features['opp_pos_fg_diff'] = np.nan
-    else:
-        # No position info
-        features['is_pg'] = 0
-        features['is_sg'] = 0
-        features['is_sf'] = 0
-        features['is_pf'] = 0
-        features['is_c'] = 0
-        features['opp_pos_fg_pct'] = np.nan
-        features['opp_pos_fg_diff'] = np.nan
-
-    # Situational
-    features['is_back_to_back'] = 0  # Assume not back-to-back unless specified
-
-    # Create DataFrame with correct feature order
+    # Create DataFrame and predict
     X = pd.DataFrame([features])[feature_names]
-
-    # Make prediction
     prediction = model.predict(X)[0]
 
     result = {
@@ -454,8 +346,8 @@ def predict_next_game(
 def evaluate_player(
     player_name: str,
     test_season: int = 2024,
-    data_dir: str = "./data/processed",
-    model_path: str = "./models/fantasy_predictor",
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+    model_path: str | Path = DEFAULT_MODEL_PATH,
 ) -> pd.DataFrame:
     """
     Evaluate model predictions for a specific player on the test set.
@@ -550,7 +442,7 @@ def evaluate_player(
 
 
 def update_game_logs_cache(
-    output_path: str = "./data/processed/game_logs_features.csv",
+    output_path: str | Path = DEFAULT_DATA_DIR / "game_logs_features.csv",
     seasons_to_fetch: int = 2,
 ) -> None:
     """
@@ -563,7 +455,7 @@ def update_game_logs_cache(
         output_path: Where to save the updated game logs
         seasons_to_fetch: How many recent seasons to fetch (default: 2 for current + last season)
     """
-    from data_fetching import fetch_and_process
+    from .data_fetching import fetch_and_process
     from datetime import datetime
 
     logger.info("Updating game logs cache...")
@@ -596,7 +488,7 @@ if __name__ == "__main__":
     """Example usage of prediction functions."""
 
     # Example: Predict next 3 games for a player
-    player = "shai gilgeous-alexander"
+    player = "keyonte george"
 
     print("=" * 80)
     print(f"PREDICTING NEXT 3 GAMES FOR {player.upper()}")

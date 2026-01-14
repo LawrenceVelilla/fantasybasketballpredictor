@@ -424,12 +424,14 @@ if __name__ == "__main__":
     logger.info("=" * 80)
 
     # Define paths
-    DATA_DIR = Path("data/processed")
+    # Define paths
+    BASE_DIR = Path(__file__).resolve().parent
+    DATA_DIR = BASE_DIR / "data" / "processed"
     GAME_LOGS_PATH = DATA_DIR / "game_logs_features.csv"
     PLAYERS_PATH = DATA_DIR / "processed_players.csv"
     TEAMS_PATH = DATA_DIR / "processed_teams.csv"
     POSITION_DEFENSE_PATH = DATA_DIR / "team_vs_position_defense.csv"
-    MODEL_OUTPUT_PATH = Path("models/fantasy_predictor.joblib")
+    MODEL_OUTPUT_PATH = BASE_DIR / "models" / "fantasy_predictor.joblib"
 
     # Load data
     logger.info("\n1. Loading data...")
